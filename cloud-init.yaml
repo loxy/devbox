@@ -1,0 +1,40 @@
+#cloud-config
+# devbox first boot. Rendered and passed to `multipass launch` by host/create-vm.sh;
+# double-underscore placeholders are filled in there. Everything secret-free and non-interactive
+# happens here; the rest is left to `devbox-doctor` (see docs/provisioning.md).
+
+# Fresh VMs often boot with a wrong clock, and apt rejects "not yet valid"
+# repo signatures. Turn NTP on and give it a moment before packages install.
+bootcmd:
+  - [sh, -c, "timedatectl set-ntp true; for i in $(seq 30); do [ \"$(timedatectl show -p NTPSynchronized --value)\" = yes ] && break; sleep 1; done"]
+
+package_update: true
+package_upgrade: true
+packages:
+  - chrony            # replaces systemd-timesyncd; configured by system/chrony-setup.sh
+  - git
+  - make
+  - build-essential
+  - jq
+  - curl
+  - unzip
+  - ca-certificates
+  - gnupg
+  - ncdu
+  - whiptail
+
+ssh_authorized_keys:
+__SSH_AUTHORIZED_KEYS__
+
+runcmd:
+  # Clone devbox over HTTPS (no GitHub key exists yet).
+  - [sudo, -u, ubuntu, -H, sh, -c, "mkdir -p ~/dev && { [ -d ~/dev/devbox/.git ] || git clone --branch '__DEVBOX_REF__' '__DEVBOX_REPO__' ~/dev/devbox; }"]
+  # Clock recovery after host sleep: `makestep 1 -1` at the end of chrony.conf.
+  - [bash, /home/ubuntu/dev/devbox/system/chrony-setup.sh]
+  # Docker CE from upstream (Ubuntu's docker.io lags behind).
+  - [sh, -c, "command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh"]
+  - [usermod, -aG, docker, ubuntu]
+  # User-level toolchains.
+  - [sudo, -u, ubuntu, -H, bash, /home/ubuntu/dev/devbox/bootstrap.sh]
+
+final_message: "devbox ready after $UPTIME s. Next: multipass shell <name>, then run devbox-doctor."

@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# vm-cleanup — free disk space on a dev VM without touching settings,
+# projects, named Docker volumes or tagged images. Part of devbox.
+#
+#   vm-cleanup            dry run: show what would be cleaned
+#   vm-cleanup -i         interactive checklist (safe steps pre-selected)
+#   vm-cleanup --apply    clean caches (safe tier)
+#   vm-cleanup --apply --deep
+#                         also JetBrains indexes + old IDE versions, Go module
+#                         cache, unused mise/Volta toolchains, anonymous volumes
+#
+# To explore what else is big: ncdu ~   or   sudo ncdu -x /
+# History of runs: ~/.local/state/vm-cleanup.log   Exit code 1 = a step or health check failed.
+# Per-machine settings: ~/.config/devbox/vm-cleanup.conf (see docs/maintenance.md)
+set -uo pipefail
+shopt -s nullglob
+
+APPLY=0 DEEP=0 INTERACTIVE=0
+for arg in "$@"; do
+  case "$arg" in
+    --apply) APPLY=1 ;;
+    --deep)  DEEP=1 ;;
+    -i|--interactive) INTERACTIVE=1 ;;
+    -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
+
+# Under sudo, $HOME may point at /root and every step would clean the wrong home.
+if (( EUID == 0 )); then
+  echo "run as your normal user, not root" >&2; exit 2
+fi
+
+# Tools come from mise (go) and volta (npm); make them visible under cron/timers.
+export PATH="$HOME/.local/share/mise/shims:$HOME/.volta/bin:$HOME/.local/bin:$PATH"
+
+# Defaults; override any of them in the per-machine config below.
+BUILDKIT_KEEP_DAYS=7        # default builder: drop cache older than this
+CROSSBUILDER=               # extra buildx builder (docker-container driver) to cap, if any
+CROSSBUILDER_MAX=2gb        # …at this size
+PROJECT_ROOT=$HOME/dev      # scanned for Volta node pins
+# Images the health check expects to survive (locally built, can't be re-pulled).
+KEEP_IMAGES=()
+LOG=$HOME/.local/state/vm-cleanup.log
+CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/devbox/vm-cleanup.conf
+# shellcheck source=/dev/null
+[[ -f $CONFIG ]] && source "$CONFIG"
+JB_DIST=$HOME/.cache/JetBrains/RemoteDev/dist
+
+size() { local p=() x; for x in "$@"; do [[ -e $x ]] && p+=("$x"); done; (( ${#p[@]} )) || return 0; du -xsch "${p[@]}" 2>/dev/null | tail -1 | cut -f1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+q() { printf '%q ' "$@"; }    # shell-quote paths baked into step commands
+ide_running() { pgrep -f 'remote-dev-server|JetBrains/RemoteDev|com\.intellij' >/dev/null; }
+used() { df -h / | awk 'NR==2{print $3" used, "$4" free ("$5")"}'; }
+
+# Data dirs (e.g. IntelliJIdea2026.1) the installed remote backends run on.
+declare -A JB_ACTIVE=()
+jb_infos=("$JB_DIST"/*/product-info.json)
+if (( ${#jb_infos[@]} )) && have jq; then
+  while IFS= read -r name; do [[ -n $name ]] && JB_ACTIVE[$name]=1; done \
+    < <(jq -r '.dataDirectoryName // empty' "${jb_infos[@]}" 2>/dev/null)
+fi
+
+# All but the newest version dir per JetBrains product under the given parents,
+# minus any dir an installed backend uses. Never applied to ~/.config (settings).
+old_jetbrains_versions() {
+  local parent d
+  for parent in "$@"; do
+    for d in "$parent"/*[0-9][0-9][0-9][0-9].[0-9]*; do
+      [[ $d == *-backup ]] || echo "$d"
+    done \
+      | sed -E 's/^(.*[^0-9])([0-9]{4}\.[0-9]+)$/\1 \2/' \
+      | sort -k1,1 -k2,2V \
+      | awk '{ if ($1 == prev) print last; prev = $1; last = $1 $2 }'
+  done | while IFS= read -r d; do
+    [[ -n ${JB_ACTIVE[${d##*/}]:-} ]] || echo "$d"
+  done
+}
+
+# Backend dists (~4 GB each) to drop: keep the newest per product and any that
+# is running. A dist without product-info.json (aborted download) counts as its
+# own product, so it never displaces a working backend.
+old_jetbrains_dists() {
+  local d code
+  declare -A seen=()
+  while IFS= read -r d; do
+    d=${d%/}
+    code=$(jq -r '.productCode // empty' "$d/product-info.json" 2>/dev/null)
+    code=${code:-unknown:${d##*/}}
+    if [[ -z ${seen[$code]:-} ]]; then seen[$code]=1; continue; fi
+    pgrep -f -- "$d/" >/dev/null && continue
+    echo "$d"
+  done < <(ls -dt "$JB_DIST"/*/ 2>/dev/null)
+}
+
+# Node versions Volta must keep: the default, versions tools were installed
+# with, and every `volta.node` pin in a package.json under $PROJECT_ROOT.
+# Lines starting with "!" mean the set is incomplete and nothing may be removed.
+volta_needed() {
+  local list f pin
+  if ! list=$(volta list all --format plain 2>/dev/null) \
+     || ! grep -qE 'node@[0-9.]+ \(default\)' <<<"$list"; then
+    echo "!volta list failed or shows no default node"; return
+  fi
+  grep -oE 'node@[0-9.]+ \(default\)|/ node@[0-9.]+' <<<"$list" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+'
+  have jq || { echo "!jq not installed"; return; }
+  # One jq per file: a single unparseable package.json must not hide later pins.
+  while IFS= read -r -d '' f; do
+    if pin=$(jq -r 'if type == "object" then (.volta.node? // empty) else empty end' "$f" 2>/dev/null); then
+      [[ -n $pin ]] && echo "$pin"
+    else
+      echo "!unreadable ${f#"$HOME"/}"
+    fi
+  done < <(find "$PROJECT_ROOT" -name node_modules -prune -o -name package.json -print0 2>/dev/null)
+}
+
+# --- step registry ----------------------------------------------------------
+# add <id> <safe|deep> <description> <size hint> <command (run via bash -c)>
+S_ID=() S_TIER=() S_DESC=() S_HINT=() S_CMD=() NOTES=()
+add() { S_ID+=("$1"); S_TIER+=("$2"); S_DESC+=("$3"); S_HINT+=("$4"); S_CMD+=("$5"); }
+# Steps that must not run while the IDE backend is up (re-checked before running).
+NEEDS_IDE_OFF=" jetbrains jbdist "
+
+if have npm; then
+  # content-v2 at top level is a legacy cache layout `npm cache clean` ignores.
+  add npm safe "npm + npx caches" "$(size ~/.npm/_cacache ~/.npm/_npx ~/.npm/content-v2)" \
+    'npm cache clean --force; rm -rf "$HOME"/.npm/_npx/* "$HOME"/.npm/content-v2'
+fi
+
+if have docker; then
+  bk_total=$(docker system df --format '{{.Type}} {{.Size}}' 2>/dev/null | sed -n 's/^Build Cache //p')
+  add buildkit safe "BuildKit cache older than ${BUILDKIT_KEEP_DAYS}d (default builder)" \
+    "${bk_total:+of $bk_total}" \
+    "docker builder prune -f --filter until=$((BUILDKIT_KEEP_DAYS * 24))h"
+  if [[ -n $CROSSBUILDER ]] && docker buildx inspect "$CROSSBUILDER" >/dev/null 2>&1; then
+    add crossbuild safe "BuildKit cache capped at $CROSSBUILDER_MAX ($CROSSBUILDER)" \
+      "$(docker buildx du --builder "$CROSSBUILDER" 2>/dev/null | awk '/^Total:/{print $2}')" \
+      "docker buildx prune --builder $(q "$CROSSBUILDER")-f --max-used-space $CROSSBUILDER_MAX"
+  fi
+  # Dangling (untagged) images only. Never `image prune -a`: it deletes every
+  # image without a running container, incl. locally-built ones that can't be re-pulled.
+  add images safe "untagged Docker images" \
+    "$(docker images -qf dangling=true | wc -l) images" "docker image prune -f"
+fi
+
+if have go; then
+  add gobuild safe "Go build + test cache" "$(size ~/.cache/go-build)" \
+    'go clean -cache -testcache -fuzzcache'
+fi
+
+# JVM crash leftovers (IntelliJ OOM heap dumps can be several GB each).
+crash_dumps=(~/java_error_in_*.hprof ~/java_error_in_*.log ~/hs_err_pid*.log)
+(( ${#crash_dumps[@]} )) && add crashdump safe "JVM crash dumps in ~ (${#crash_dumps[@]} files)" \
+  "$(size "${crash_dumps[@]}")" "rm -f $(q "${crash_dumps[@]}")"
+
+if ide_running; then
+  NOTES+=("JetBrains indexes skipped: IDE backend is running (disconnect first)")
+else
+  # Indexes/caches only. RemoteDev/dist is the downloaded IDE backend itself
+  # (deleting it forces a full re-download); LocalHistory is user data.
+  jb_targets=(~/.cache/JetBrains/*/{index,caches,vcs-log,log})
+  (( ${#jb_targets[@]} )) && add jetbrains deep "JetBrains indexes + caches (backend kept)" \
+    "$(size "${jb_targets[@]}")" "rm -rf $(q "${jb_targets[@]}")"
+  # Backend versions superseded by an IDE update: keep the newest per product.
+  if have jq; then
+    mapfile -t old_dists < <(old_jetbrains_dists)
+    (( ${#old_dists[@]} )) && add jbdist deep "old JetBrains backend versions" \
+      "$(size "${old_dists[@]}")" "rm -rf $(q "${old_dists[@]}")"
+  fi
+fi
+
+# Caches/plugins of previous IDE versions. The backend's own data dir is
+# excluded, so this is safe while connected.
+mapfile -t jb_old < <(old_jetbrains_versions ~/.cache/JetBrains ~/.local/share/JetBrains)
+(( ${#jb_old[@]} )) && add jbold deep "previous JetBrains IDE versions (caches + plugins)" \
+  "$(size "${jb_old[@]}")" "rm -rf $(q "${jb_old[@]}")"
+
+if have go; then
+  add gomod deep "Go module cache (re-downloads on next build)" \
+    "$(size ~/go/pkg/mod)" 'go clean -modcache'
+fi
+
+if have mise; then
+  # Toolchain versions no tracked mise config references; reinstalled on demand.
+  mapfile -t mise_dirs < <(cd / && mise prune --dry-run 2>&1 | sed -n 's|.*remove ~|'"$HOME"'|p')
+  (( ${#mise_dirs[@]} )) && add mise deep "unused mise tool versions (${#mise_dirs[@]})" \
+    "$(size "${mise_dirs[@]}")" 'cd / && mise prune -y'
+fi
+
+if have volta && [[ -d ~/.volta/tools/image/node ]]; then
+  # Only unpacked runtimes go. inventory/node-v*-npm are metadata Volta needs to
+  # start node — never delete those. Pinned versions re-download on demand.
+  volta_raw=$(volta_needed)
+  if grep -q '^!' <<<"$volta_raw"; then
+    NOTES+=("Volta step skipped: $(grep -m1 '^!' <<<"$volta_raw" | cut -c2-)")
+  else
+    volta_old=()
+    for d in ~/.volta/tools/image/node/*/; do
+      d=${d%/}
+      grep -qxF "${d##*/}" <<<"$volta_raw" || volta_old+=("$d")
+    done
+    (( ${#volta_old[@]} )) && add volta deep "unused Volta node versions: ${volta_old[*]##*/}" \
+      "$(size "${volta_old[@]}")" \
+      "rm -rf $(q "${volta_old[@]}"); rm -f \"\$HOME\"/.volta/tools/inventory/node/*.tar.gz"
+  fi
+fi
+
+if have docker; then
+  # all=false: only anonymous (64-hex) volumes, on any Docker version; named stay.
+  add volumes deep "unused anonymous Docker volumes" \
+    "$(docker volume ls -qf dangling=true | grep -cE '^[0-9a-f]{64}$') volumes" \
+    'docker volume prune -f --filter all=false'
+fi
+
+(( ${#S_ID[@]} )) || { echo "Nothing to clean."; exit 0; }
+
+# --- selection --------------------------------------------------------------
+SELECTED=()
+if (( INTERACTIVE )); then
+  if ! [[ -t 0 && -t 1 ]] || ! have whiptail; then
+    echo "-i needs a terminal and whiptail" >&2; exit 2
+  fi
+  items=()
+  for i in "${!S_ID[@]}"; do
+    state=OFF; [[ ${S_TIER[i]} == safe ]] && state=ON
+    items+=("${S_ID[i]}" "$(printf '%-46s %10s' "${S_DESC[i]:0:46}" "${S_HINT[i]}")" "$state")
+  done
+  text="Disk: $(used)"
+  for n in "${NOTES[@]}"; do text+=$'\n'"$n"; done
+  text+=$'\n\nSpace toggles, Enter runs. Unchecked by default = deep tier.'
+  choice=$(whiptail --title vm-cleanup --checklist "$text" 24 78 ${#S_ID[@]} \
+             "${items[@]}" 3>&1 1>&2 2>&3) || { echo "Cancelled."; exit 0; }
+  read -ra picked <<<"${choice//\"/}"
+  for id in "${picked[@]}"; do
+    for i in "${!S_ID[@]}"; do [[ ${S_ID[i]} == "$id" ]] && SELECTED+=("$i"); done
+  done
+  (( ${#SELECTED[@]} )) || { echo "Nothing selected."; exit 0; }
+  APPLY=1
+else
+  for i in "${!S_ID[@]}"; do
+    [[ ${S_TIER[i]} == safe ]] || (( DEEP )) && SELECTED+=("$i")
+  done
+fi
+
+# --- run --------------------------------------------------------------------
+FAILED=0
+before=$(used)
+echo "Disk before: $before"
+(( APPLY )) || echo "Dry run — pass --apply to clean, or -i to pick steps."
+echo
+ran=()
+for i in "${SELECTED[@]}"; do
+  if (( APPLY )); then
+    # The IDE may have connected since the menu was built.
+    if [[ $NEEDS_IDE_OFF == *" ${S_ID[i]} "* ]] && ide_running; then
+      printf '==> %s\n    skipped: IDE backend is running now\n' "${S_DESC[i]}"
+      continue
+    fi
+    printf '==> %s\n' "${S_DESC[i]}"
+    if bash -c "${S_CMD[i]}"; then
+      ran+=("${S_ID[i]}")
+    else
+      printf '    (failed, continuing)\n'
+      ran+=("${S_ID[i]}!"); (( FAILED++ ))
+    fi
+  else
+    printf '  would: %-56s %s\n' "${S_DESC[i]}" "${S_HINT[i]:+[${S_HINT[i]}]}"
+  fi
+done
+for n in "${NOTES[@]}"; do printf '  note: %s\n' "$n"; done
+
+# --- health check: did cleanup break a tool? --------------------------------
+if (( APPLY )); then
+  echo
+  echo "Health check:"
+  ok()  { printf '  %-34s %s\n' "$1" "$2"; }
+  bad() { ok "$1" "$2"; (( FAILED++ )); }
+  have node && { v=$(cd ~ && node --version 2>&1) && ok node "$v" || bad node "BROKEN: $v"; }
+  have npm  && { v=$(cd ~ && npm --version 2>&1)  && ok npm "$v"  || bad npm "BROKEN: $v"; }
+  have go   && { v=$(cd ~ && go version 2>&1)     && ok go "${v#go version }" || bad go "BROKEN: $v"; }
+  if have docker; then
+    for img in "${KEEP_IMAGES[@]}"; do
+      docker image inspect "$img" >/dev/null 2>&1 && ok "$img" present || bad "$img" MISSING
+    done
+  fi
+fi
+
+# --- report only ------------------------------------------------------------
+echo
+echo "Not touched (review manually if needed):"
+have docker && docker system df 2>/dev/null | sed 's/^/  /'
+printf '  journald: %s\n' "$(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMGT]' | head -1)"
+printf '  apt autoremove candidates: %s\n' "$(apt-get -s autoremove 2>/dev/null | grep -c '^Remv')"
+echo "  biggest in ~ (explore with: ncdu ~):"
+du -xsh ~/* ~/.[!.]* 2>/dev/null | sort -h | tail -6 | sed 's/^/    /'
+echo
+after=$(used)
+echo "Disk after:  $after"
+
+if (( APPLY )) && (( ${#ran[@]} )); then
+  mkdir -p "$(dirname "$LOG")"
+  printf '%s  before: %s  after: %s  steps: %s%s\n' \
+    "$(date '+%F %T')" "$before" "$after" "${ran[*]}" \
+    "$( (( FAILED )) && echo "  FAILURES: $FAILED")" >> "$LOG"
+fi
+
+if (( FAILED )); then
+  echo "$FAILED failure(s) — see above." >&2
+  exit 1
+fi

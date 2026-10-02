@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# devbox-doctor — check a devbox VM and list what is still missing.
+# Read-only: it never changes anything, it only tells you the next command.
+# Exit code: 0 = all good, 1 = something needs action.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$HOME/.volta/bin:$PATH"
+
+PROBLEMS=0
+ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
+warn() { printf '  \033[33m!\033[0m %s\n' "$1"; [[ -n ${2:-} ]] && printf '      → %s\n' "$2"; }
+fail() { printf '  \033[31m✗\033[0m %s\n' "$1"; [[ -n ${2:-} ]] && printf '      → %s\n' "$2"; (( PROBLEMS++ )); }
+have() { command -v "$1" >/dev/null 2>&1; }
+section() { printf '\n%s\n' "$1"; }
+
+section "Clock"
+# Ask chrony when it runs: after it steps the clock, the kernel flag that
+# timedatectl reports stays "unsynchronized" until chrony's next update.
+if systemctl is-active -q chrony && have chronyc; then
+  synced=$(chronyc tracking 2>/dev/null | grep -q '^Leap status *: Normal' && echo yes)
+else
+  synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)
+fi
+if [[ $synced == yes ]]; then
+  ok "clock synchronized"
+else
+  fail "clock not synchronized (TLS + apt break)" "sudo timedatectl set-ntp true; see docs/provisioning.md#clock"
+fi
+# The effective makestep is the LAST one chrony reads; same rule as system/chrony-setup.sh.
+# (A conf.d drop-in doesn't count: Ubuntu includes conf.d before the stock makestep.)
+if systemctl is-active -q chrony && [[ -r /etc/chrony/chrony.conf ]] && awk '
+    /^[ \t]*makestep[ \t]/ { m = $1 " " $2 " " $3; after = 0 }
+    /^[ \t]*(confdir|include)[ \t]/ { after = 1 }
+    END { exit !(m == "makestep 1 -1" && !after) }' /etc/chrony/chrony.conf; then
+  ok "chrony steps the clock after host sleep (effective: makestep 1 -1)"
+else
+  fail "clock won't recover quickly after the host sleeps" "sudo ~/dev/devbox/system/chrony-setup.sh"
+fi
+
+section "Disk"
+pct=$(df --output=pcent / | tail -1 | tr -dc 0-9)
+free=$(df -h --output=avail / | tail -1 | tr -d ' ')
+if   (( pct >= 90 )); then fail "/ is ${pct}% full (${free} free)" "vm-cleanup -i"
+elif (( pct >= 80 )); then warn "/ is ${pct}% full (${free} free)" "vm-cleanup -i"
+else ok "/ is ${pct}% full (${free} free)"; fi
+
+section "Docker"
+if ! have docker; then
+  fail "docker not installed" "curl -fsSL https://get.docker.com | sh"
+elif docker info >/dev/null 2>&1; then
+  ok "docker works without sudo"
+elif id -nG | grep -qw docker; then
+  fail "docker daemon not reachable" "sudo systemctl start docker"
+else
+  fail "not in the docker group in this shell" "sudo usermod -aG docker \$USER, then log out and in"
+fi
+
+section "Toolchains (as a non-interactive login shell sees them: IDE backends, ssh cmd, MCP servers)"
+# Use a clean environment: this shell's PATH may contain entries a fresh login wouldn't.
+login_path=$(env -i HOME="$HOME" USER="$USER" bash -lc 'echo "$PATH"' 2>/dev/null)
+for t in node npx go claude git jq ncdu; do
+  if PATH=$login_path command -v "$t" >/dev/null 2>&1; then
+    ok "$t"
+  elif have "$t"; then
+    fail "$t works here but not in a fresh login shell" "bash ~/dev/devbox/bootstrap.sh   (writes the PATH block in ~/.profile)"
+  else
+    fail "$t missing" "bash ~/dev/devbox/bootstrap.sh"
+  fi
+done
+
+section "Identity & access (manual steps)"
+if git config --global user.name >/dev/null && git config --global user.email >/dev/null; then
+  ok "git identity: $(git config --global user.name) <$(git config --global user.email)>"
+else
+  fail "no git identity" "git config --global user.name '…' && git config --global user.email '…'"
+fi
+if ! ls ~/.ssh/id_* >/dev/null 2>&1; then
+  fail "no SSH key for GitHub" "ssh-keygen -t ed25519 -C \"\$(hostname)\", then add ~/.ssh/id_ed25519.pub at github.com/settings/keys"
+else
+  gh_out=$(ssh -T -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new git@github.com 2>&1)
+  if grep -q 'successfully authenticated' <<<"$gh_out"; then
+    ok "GitHub SSH: ${gh_out%%!*}"
+  else
+    fail "GitHub rejects this VM's SSH key" "add ~/.ssh/id_ed25519.pub at github.com/settings/keys, then: ssh -T git@github.com"
+  fi
+fi
+if [[ -s ~/.claude/.credentials.json ]]; then
+  ok "Claude Code logged in"
+else
+  fail "Claude Code not logged in" "claude   (follow the login prompt)"
+fi
+
+section "Housekeeping"
+if [[ -f ~/.local/state/vm-cleanup.log ]]; then
+  ok "last vm-cleanup: $(tail -1 ~/.local/state/vm-cleanup.log | cut -c1-19)"
+else
+  warn "vm-cleanup never applied on this VM" "vm-cleanup   (dry run first)"
+fi
+
+echo
+if (( PROBLEMS )); then
+  echo "$PROBLEMS item(s) need action. Project-specific setup (secrets, .env files) is in each project's own docs."
+  exit 1
+fi
+echo "All good."

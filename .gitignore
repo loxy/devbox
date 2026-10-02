@@ -1,0 +1,8 @@
+# JetBrains IDE project files
+.idea/
+*.iml
+
+# editor / OS leftovers
+*.swp
+*~
+.DS_Store
